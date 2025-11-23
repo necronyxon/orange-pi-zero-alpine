@@ -1,101 +1,95 @@
-#! /bin/sh
+#!/bin/env bash
 
-DEVICE=$1
-FILES_PATH='.'
+device="$1"
+build_dir="$PWD/out"
 
-usage() { echo "usage: $0 <device> [<path>]"; }
+usage() { echo "usage: $0 <device> [<build_dir>]"; }
 
-if [ -d "$2" ]; then
-	FILES_PATH=$2
-else
-	echo "Error: $2 is not a valid path."
-	usage
-	exit 2
-fi
+err_usage() {
+  echo "$1"
+  usage
+  exit 2
+}
 
-if [ -z "$DEVICE" ]; then
-	echo "Error: No device specified."
-	usage
-	exit 2
-fi
+[[ ! -z "$2" && -d "$2" ]] && build_dir="$2"
 
-if [ ! -b "$DEVICE" ]; then
-	echo "Error: $DEVICE is not a valid device."
-	usage
-	exit 2
-fi
+[[ -z "${device}" ]]   && err_usage "Error: No device specified"
+[[ ! -b "${device}" ]] && err_usage "Error: ${device} is not a valid device"
 
-echo "This script will destroy all data on the device you have selected ($DEVICE) and create"
+removable=$(cat "/sys/block/${device/\/dev\//}/removable")
+(( removable != 1 )) && err_usage "Error: ${device} is not removable"
+
+echo "This script will destroy all data on the device you have selected (${device}) and create"
 echo "a bootable Alpine installation for the Orange Pi Zero. Running fdisk from a script is"
 echo "generally not recommended, you will not have an opportunity to inspect changes to the"
 echo "partition table before they are written. You need to be confident that the device you"
-echo "have specified ($DEVICE) is the correct device."
+echo "have specified (${device}) is the correct device."
 echo
 while true; do
-	read -p "Are you sure you want to continue? " confirmation
-	case $(echo "$confirmation" | tr '[:upper:]' '[:lower:]') in
-			y|yes ) break;;
-			n|no ) echo "Discretion is the better part of valour. Exiting."; exit;;
-			* ) echo "Please answer yes or no.";;
-	esac
+  read -rp "Are you sure you want to continue? " confirmation
+  case $(echo "$confirmation" | tr '[:upper:]' '[:lower:]') in
+    y|yes ) break;;
+    n|no ) echo "Discretion is the better part of valour. Exiting."; exit;;
+    * ) echo "Please answer yes or no.";;
+  esac
 done
 echo
 
-if parted --script "$DEVICE"1 > /dev/null 2>&1; then
-	echo "Wiping signatures.."
-	wipefs --all --force "$DEVICE"1 > /dev/null 2>&1 \
-		|| { echo "Error: failed to remove signatures"; exit 1; }
-fi
+printf "\nWiping signatures...\n"
+wipefs --all --force "${device}1"
+[[ -b "${device}2" ]] && wipefs --all --force "${device}2"
 
-echo "Writing zeroes.."
-dd if=/dev/zero of=$DEVICE bs=1M count=1 status=none \
-	|| { echo "Error: failed to write zeros"; exit 1; }
-
-
-echo "Writing u-boot.."
-dd if=$FILES_PATH/u-boot-sunxi-with-spl.bin of=$DEVICE bs=1024 seek=8 status=none \
-	|| { echo "Error: failed to write u-boot"; exit 1; }
-
-echo "Creating partition.."
 # from https://superuser.com/a/984637
 # include comments so we can see what operations are taking place, but
 # strip the comments with sed before sending arguments to fdisk
-FDISK_OUTPUT=$(sed -e 's/\s*\([\+0-9a-zA-Z]*\).*/\1/' << EOF | fdisk $DEVICE
-	n		# add new
-	p		# primary partition
-	1		# numbered 1
-	2048	# from sector 2048
-			# to the last sector
-	t		# of type
-	c		# W95 FAT32 (LBA)
-	a		# make it bootable
-	w		# save changes
-	q		# exit fdisk
+sed -e 's/\s*\([\+0-9a-zA-Z]*\).*/\1/' << EOF | fdisk "${device}"
+  o       # new empty MBR partition table
+  n       # new partition
+  p       # primary
+  1       # numbered 1
+  2048    # from sector 2048
+  +500M   # +500M
+  t       # of type
+  c       # W95 FAT32 (LBA)
+  a       # make it bootable
+  n       # new partition
+  p       # primary
+  2       # numbered 2
+          # from next available sector
+  -0      # to the last sector
+  w       # save changes
+  q       # exit fdisk
 EOF
-)
 
-echo "Formating partition.."
-mkfs.vfat -n ALPINE "$DEVICE"1 >/dev/null \
-	|| { echo "Error: failed to make vfat partition"; exit 1; }
+printf "\nFormating partitions...\n"
+mkfs.fat -n ALPINE "${device}1"
+mkfs.ext4 -L ALPINE_VAR "${device}2"
+
+printf "\nWriting u-boot...\n"
+dd if=/dev/zero of="${device}" bs=1k count=1023 seek=1
+dd if="${build_dir}/u-boot-sunxi-with-spl.bin" of="${device}" bs=1024 seek=8
 
 cleanup() {
-	mountpoint -q $TEMP_MOUNT && umount "$TEMP_MOUNT"
-	[ -d $TEMP_MOUNT ] && rm -rf $TEMP_MOUNT
+  mountpoint -q "${TEMP_MOUNT}" && umount "${TEMP_MOUNT}"
+  [[ -d "${TEMP_MOUNT}" ]]      && rm -rf "${TEMP_MOUNT}"
 }
-
-TEMP_MOUNT=$(mktemp -d -t opizero-alpine-XXXXXXXX)
-
+TEMP_MOUNT=$(mktemp -d -t opi-zero-alpine-XXXXXXXX)
 trap 'cleanup' EXIT
 
-echo "Mounting device.."
-mount "$DEVICE"1 $TEMP_MOUNT \
-	|| { echo "Error: failed to mount ${DEVICE}1"; exit 1; }
+err_exit() {
+  echo "$1"
+  exit 1
+}
 
-echo "Copying files.."
-{ cp -r $FILES_PATH/apks "$TEMP_MOUNT"/ && cp -r $FILES_PATH/boot "$TEMP_MOUNT"/; } \
-	|| { echo "Error: failed to copy from $FILES_PATH"; exit 1; }
+printf "\nCopying files...\n"
+mount "${device}1" "${TEMP_MOUNT}"               || err_exit "Error: failed to mount ${device}1"
+cp -r "${build_dir}/"{apks,boot} "${TEMP_MOUNT}" || err_exit "Error: failed to copy files from ${build_dir}/{apks,boot}"
+umount "${device}1"                              || err_exit "Error: failed to unmount ${device}1"
 
-echo "Ejecting device.."
-eject $DEVICE || true
+mount "${device}2" "${TEMP_MOUNT}"               || err_exit "Error: failed to mount ${device}2"
+cp -r "${build_dir}/var" "${TEMP_MOUNT}"         || err_exit "Error: failed to copy files from ${build_dir}/var}"
+
+printf "\nEjecting device...\n"
+eject "${device}" || true
 
 echo "Done!"

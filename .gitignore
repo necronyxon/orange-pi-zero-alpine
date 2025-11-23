@@ -4,3 +4,4 @@ source/
 autom4te.cache/
 config.log
 configure.scan
+out/
